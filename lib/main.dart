@@ -1,5 +1,5 @@
 import 'package:material_ui/material_ui.dart';
-import 'screens/trip_screen.dart';
+import 'screens/home_screen.dart';
 
 void main() {
   runApp(const MyApp());
@@ -17,7 +17,7 @@ class MyApp extends StatelessWidget {
           seedColor: const Color.fromARGB(255, 255, 102, 55),
         ),
       ),
-      home: const ViagemScreen(),
+      home: const HomeScreen(),
     );
   }
 }

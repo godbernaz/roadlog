@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:material_ui/material_ui.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:drift/drift.dart' show Value;
+import '../database.dart';
 
 class ViagemScreen extends StatefulWidget {
   const ViagemScreen({super.key});
@@ -94,13 +96,33 @@ class _ViagemScreenState extends State<ViagemScreen> {
     });
   }
 
-  // 4. Termina a viagem
-  void _parar() {
+    // 4. Termina a viagem e guarda-a no histórico
+  Future<void> _parar() async {
     _cronometro.stop();
     _timer?.cancel();
-    _gps?.cancel();
+    await _gps?.cancel();
     WakelockPlus.disable();
     setState(() {});
+
+    // TODO: antes de publicar, voltar a ignorar viagens com menos de 2 pontos
+
+    await db.guardarViagem(
+      ViagensCompanion.insert(
+        inicio: _inicio!,
+        fim: DateTime.now(),
+        distanciaMetros: _distanciaMetros,
+      ),
+      _pontos
+          .map((p) => PontosCompanion(
+                hora: Value(p.timestamp),
+                latitude: Value(p.latitude),
+                longitude: Value(p.longitude),
+                velocidade: Value(p.speed),
+                precisao: Value(p.accuracy),
+              ))
+          .toList(),
+    );
+    _aviso('Viagem guardada no histórico.');
   }
 
   String _formatar(Duration d) {
