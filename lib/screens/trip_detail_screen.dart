@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:material_ui/material_ui.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' hide Size;
 import '../database.dart';
+import '../sectors.dart';
 
 class DetalheViagemScreen extends StatefulWidget {
   const DetalheViagemScreen({
@@ -23,60 +24,18 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
   Size _tamanhoMapa = Size.zero;
   bool _estiloPronto = false;
   bool _desenhado = false;
+  bool _aDesenhar = false;
   bool _em3d = false;
   List<Ponto> _pontos = [];
-  
-  // Inclina ou endireita a câmara, com animação
-  Future<void> _alternar3d() async {
-    setState(() => _em3d = !_em3d);
-    await _mapa?.flyTo(
-      CameraOptions(pitch: _em3d ? 60 : 0),
-      MapAnimationOptions(duration: 1000),
-    );
-  }
 
-    // Cor de cada troço consoante a velocidade (km/h)
-  String _corPara(double kmh) {
-    if (kmh < 15) return '#E53935'; // vermelho: parado / trânsito
-    if (kmh < 40) return '#FB8C00'; // laranja: lento
-    return '#1E88E5'; // azul: a andar bem
-  }
-
-  Map<String, dynamic> _troco(List<List<double>> coords, String cor) {
-    return {
-      'type': 'Feature',
-      'properties': {'cor': cor},
-      'geometry': {'type': 'LineString', 'coordinates': coords},
-    };
-  }
-
-  // Parte o percurso em troços, cada um com a sua cor
-  Map<String, dynamic> _percursoColorido() {
-    final trocos = <Map<String, dynamic>>[];
-    var cor = '';
-    var coords = <List<double>>[];
-
-    for (var i = 1; i < _pontos.length; i++) {
-      final a = _pontos[i - 1];
-      final b = _pontos[i];
-      final va = a.velocidade < 0 ? 0.0 : a.velocidade; // -1 = desconhecida
-      final vb = b.velocidade < 0 ? 0.0 : b.velocidade;
-      final c = _corPara((va + vb) / 2 * 3.6);
-
-      if (c != cor) {
-        // A cor mudou: fecha o troço anterior e começa outro em "a"
-        if (coords.length > 1) trocos.add(_troco(coords, cor));
-        coords = [
-          [a.longitude, a.latitude],
-        ];
-        cor = c;
-      }
-      coords.add([b.longitude, b.latitude]);
-    }
-    if (coords.length > 1) trocos.add(_troco(coords, cor));
-
-    return {'type': 'FeatureCollection', 'features': trocos};
-  }
+  // Setores (só existem se a viagem pertencer a uma rota)
+  bool _temSetores = false;
+  bool _modoSetores = false;
+  List<CorSetor> _cores = [];
+  List<int> _setorDoPonto = [];
+  List<double>? _meusTempos;
+  List<double>? _temposAnteriores;
+  List<double>? _melhoresAntes;
 
   @override
   void initState() {
@@ -86,6 +45,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
 
   Future<void> _carregarPontos() async {
     final pontos = await db.pontosDaViagem(widget.viagem.id);
+    await _carregarSetores(pontos);
     if (!mounted) return;
     setState(() => _pontos = pontos);
     if (pontos.length < 2) {
@@ -94,6 +54,45 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       ));
     }
     await _desenharPercurso();
+  }
+
+  // Se a viagem pertence a uma rota, prepara as cores e os tempos dos setores
+  Future<void> _carregarSetores(List<Ponto> pontos) async {
+    final rotaId = widget.viagem.rotaId;
+    if (rotaId == null || pontos.length < 2) return;
+
+    var setores = await db.setoresDaRota(rotaId);
+    if (setores.isEmpty) {
+      // Rotas criadas antes da Fase 5: calcula agora
+      await db.recalcularSetoresDaRota(rotaId);
+      setores = await db.setoresDaRota(rotaId);
+    }
+    final referenciaId = (await db.rotaPorId(rotaId)).viagemReferenciaId;
+    if (setores.isEmpty || referenciaId == null) return;
+
+    final tempos = await db.temposDaRota(rotaId);
+    final meus = tempos[widget.viagem.id];
+    if (meus == null) return; // esta volta não é comparável com a rota
+
+    final referencia = await db.pontosDaViagem(referenciaId);
+    final fronteiras = [for (final s in setores.skip(1)) s.inicioMetros];
+    final ids = tempos.keys.toList();
+    final anteriores = [
+      for (final id in ids.take(ids.indexOf(widget.viagem.id))) tempos[id]!,
+    ];
+
+    _meusTempos = meus;
+    _temposAnteriores = anteriores.isEmpty ? null : anteriores.last;
+    _melhoresAntes = anteriores.isEmpty
+        ? null
+        : [
+            for (var k = 0; k < meus.length; k++)
+              anteriores.map((t) => t[k]).reduce((a, b) => math.min(a, b)),
+          ];
+    _cores = coresDaVolta(widget.viagem.id, tempos);
+    _setorDoPonto = setorDeCadaPonto(pontos, referencia, fronteiras);
+    _temSetores = true;
+    _modoSetores = true; // se há setores, mostra-os primeiro
   }
 
   void _mapaCriado(MapboxMap mapa) {
@@ -105,20 +104,104 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     await _desenharPercurso();
   }
 
-  // Só desenha quando o mapa, o estilo e os pontos estiverem todos prontos.
+  // --- Cores -------------------------------------------------------------
+
+  // Velocidade: verde, roxo e amarelo ficam reservados para os setores
+  String _corPara(double kmh) {
+    if (kmh < 15) return '#E53935'; // vermelho: parado / trânsito
+    if (kmh < 40) return '#FB8C00'; // laranja: lento
+    return '#1E88E5'; // azul: a andar bem
+  }
+
+  // Setores: roxo / verde / amarelo / cinzento
+  String _corDoSetor(int indice) {
+    if (indice >= _cores.length) return '#9E9E9E';
+    return switch (_cores[indice]) {
+      CorSetor.roxo => '#8E24AA',
+      CorSetor.verde => '#43A047',
+      CorSetor.amarelo => '#FDD835',
+      CorSetor.cinzento => '#9E9E9E',
+    };
+  }
+
+  Color _cor(String hex) => Color(int.parse('FF${hex.substring(1)}', radix: 16));
+
+  Map<String, dynamic> _troco(List<List<double>> coords, String cor) {
+    return {
+      'type': 'Feature',
+      'properties': {'cor': cor},
+      'geometry': {'type': 'LineString', 'coordinates': coords},
+    };
+  }
+
+  // Modo Velocidade: um troço novo sempre que a cor da velocidade muda
+  Map<String, dynamic> _percursoColorido() {
+    final trocos = <Map<String, dynamic>>[];
+    var cor = '';
+    var coords = <List<double>>[];
+    for (var i = 1; i < _pontos.length; i++) {
+      final a = _pontos[i - 1];
+      final b = _pontos[i];
+      final va = a.velocidade < 0 ? 0.0 : a.velocidade;
+      final vb = b.velocidade < 0 ? 0.0 : b.velocidade;
+      final c = _corPara((va + vb) / 2 * 3.6);
+      if (c != cor) {
+        if (coords.length > 1) trocos.add(_troco(coords, cor));
+        coords = [
+          [a.longitude, a.latitude],
+        ];
+        cor = c;
+      }
+      coords.add([b.longitude, b.latitude]);
+    }
+    if (coords.length > 1) trocos.add(_troco(coords, cor));
+    return {'type': 'FeatureCollection', 'features': trocos};
+  }
+
+  // Modo Setores: um troço por setor, com a cor do setor
+  Map<String, dynamic> _percursoPorSetores() {
+    final trocos = <Map<String, dynamic>>[];
+    var setor = -1;
+    var coords = <List<double>>[];
+    for (var i = 0; i < _pontos.length; i++) {
+      final ponto = [_pontos[i].longitude, _pontos[i].latitude];
+      final s = _setorDoPonto[i];
+      if (s != setor) {
+        // Fecha o setor anterior neste ponto, para a linha não ter buracos
+        if (coords.isNotEmpty) {
+          coords.add(ponto);
+          trocos.add(_troco(coords, _corDoSetor(setor)));
+        }
+        coords = [ponto];
+        setor = s;
+      } else {
+        coords.add(ponto);
+      }
+    }
+    if (coords.length > 1) trocos.add(_troco(coords, _corDoSetor(setor)));
+    return {'type': 'FeatureCollection', 'features': trocos};
+  }
+
+  // --- Desenhar ----------------------------------------------------------
+
+  // Desenha (ou redesenha, ao trocar de modo) a linha do percurso
   Future<void> _desenharPercurso() async {
     final mapa = _mapa;
-    if (mapa == null || !_estiloPronto || _pontos.length < 2 || _desenhado) {
+    if (mapa == null || !_estiloPronto || _pontos.length < 2 || _aDesenhar) {
       return;
+    }
+    _aDesenhar = true;
+    final primeiraVez = !_desenhado;
+    if (_desenhado) {
+      await mapa.removeStyleLayer('percurso-linha');
+      await mapa.removeStyleLayer('percurso-contorno');
+      await mapa.removeStyleSource('percurso');
     }
     _desenhado = true;
 
-    await mapa.style.addSource(
-      GeoJsonSource(id: 'percurso', data: jsonEncode(_percursoColorido())),
-    );
-
-    // 1. Contorno branco, mais largo, por baixo
-    await mapa.style.addLayer(LineLayer(
+    final dados = _modoSetores ? _percursoPorSetores() : _percursoColorido();
+    await mapa.addSource(GeoJsonSource(id: 'percurso', data: jsonEncode(dados)));
+    await mapa.addLayer(LineLayer(
       id: 'percurso-contorno',
       sourceId: 'percurso',
       lineWidth: 10.0,
@@ -127,9 +210,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       lineEmissiveStrength: 1.0,
       lineColor: Colors.white.toARGB32(),
     ));
-
-    // 2. A linha colorida por cima: cada troço usa a sua propriedade "cor"
-    await mapa.style.addLayer(LineLayer(
+    await mapa.addLayer(LineLayer(
       id: 'percurso-linha',
       sourceId: 'percurso',
       lineWidth: 6.0,
@@ -138,11 +219,25 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       lineEmissiveStrength: 1.0,
       lineColorExpression: ['get', 'cor'],
     ));
-
-    await _enquadrar();
+    _aDesenhar = false;
+    if (primeiraVez) await _enquadrar();
   }
 
-  // Move a câmara para mostrar o percurso inteiro
+  void _mudarModo(bool setores) {
+    setState(() => _modoSetores = setores);
+    _desenharPercurso();
+  }
+
+  // --- Câmara ------------------------------------------------------------
+
+  Future<void> _alternar3d() async {
+    setState(() => _em3d = !_em3d);
+    await _mapa?.flyTo(
+      CameraOptions(pitch: _em3d ? 60 : 0),
+      MapAnimationOptions(duration: 1000),
+    );
+  }
+
   Future<void> _enquadrar() async {
     final mapa = _mapa;
     if (mapa == null || _pontos.isEmpty) return;
@@ -163,13 +258,15 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     await mapa.flyTo(camera, MapAnimationOptions(duration: 1200));
   }
 
+  // --- Números ------------------------------------------------------------
+
   double get _velocidadeMaxKmh {
     if (_pontos.isEmpty) return 0;
-    final max = _pontos.map((p) => p.velocidade).reduce((a, b) => math.max(a, b));
+    final max =
+        _pontos.map((p) => p.velocidade).reduce((a, b) => math.max(a, b));
     return max * 3.6;
   }
 
-  // Soma o tempo dos troços feitos a menos de 15 km/h
   Duration get _tempoLento {
     var segundos = 0;
     for (var i = 1; i < _pontos.length; i++) {
@@ -188,14 +285,18 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
+  String _segundos(double s) =>
+      _formatar(Duration(milliseconds: (s * 1000).round()));
+
+  String _diferenca(double segundos) {
+    final sinal = segundos < 0 ? '−' : '+';
+    return '$sinal${segundos.abs().toStringAsFixed(1)} s';
+  }
+
+  // --- Ecrã ---------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
-    final v = widget.viagem;
-    final duracao = v.fim.difference(v.inicio);
-    final km = v.distanciaMetros / 1000;
-    final horas = duracao.inSeconds / 3600;
-    final media = horas == 0 ? 0.0 : km / horas;
-
     return Scaffold(
       appBar: AppBar(title: Text(widget.titulo)),
       body: Column(
@@ -203,7 +304,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
-                _tamanhoMapa = constraints.biggest; // usado no _enquadrar
+                _tamanhoMapa = constraints.biggest;
                 return Stack(
                   children: [
                     MapWidget(
@@ -211,7 +312,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
                       styleUri: MapboxStyles.STANDARD,
                       viewport: CameraViewportState(
                         center: Point(coordinates: Position(-8.61, 41.15)),
-                        zoom: 11, // Porto, só até o percurso carregar
+                        zoom: 11,
                       ),
                       onMapCreated: _mapaCriado,
                       onStyleLoadedListener: _estiloCarregado,
@@ -232,7 +333,8 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
                           FloatingActionButton.extended(
                             heroTag: 'vista-3d',
                             onPressed: _alternar3d,
-                            icon: Icon(_em3d ? Icons.map_outlined : Icons.view_in_ar),
+                            icon: Icon(
+                                _em3d ? Icons.map_outlined : Icons.view_in_ar),
                             label: Text(_em3d ? '2D' : '3D'),
                           ),
                         ],
@@ -246,22 +348,85 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
           SafeArea(
             top: false,
             child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Wrap(
-                alignment: WrapAlignment.spaceAround,
-                spacing: 24,
-                runSpacing: 12,
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  _Dado('Duração', _formatar(duracao)),
-                  _Dado('Distância', '${km.toStringAsFixed(2)} km'),
-                  _Dado('Média', '${media.toStringAsFixed(0)} km/h'),
-                  _Dado('Máxima', '${_velocidadeMaxKmh.toStringAsFixed(0)} km/h'),
-                  _Dado('Em lentidão', _formatar(_tempoLento)),
+                  if (_temSetores) ...[
+                    SegmentedButton<bool>(
+                      segments: const [
+                        ButtonSegment(
+                          value: false,
+                          label: Text('Velocidade'),
+                          icon: Icon(Icons.speed),
+                        ),
+                        ButtonSegment(
+                          value: true,
+                          label: Text('Setores'),
+                          icon: Icon(Icons.flag),
+                        ),
+                      ],
+                      selected: {_modoSetores},
+                      onSelectionChanged: (s) => _mudarModo(s.first),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  if (_modoSetores) _tabelaSetores() else _numeros(),
                 ],
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  // Os números gerais da viagem (modo Velocidade)
+  Widget _numeros() {
+    final v = widget.viagem;
+    final duracao = v.fim.difference(v.inicio);
+    final km = v.distanciaMetros / 1000;
+    final horas = duracao.inSeconds / 3600;
+    final media = horas == 0 ? 0.0 : km / horas;
+    return Wrap(
+      alignment: WrapAlignment.spaceAround,
+      spacing: 24,
+      runSpacing: 12,
+      children: [
+        _Dado('Duração', _formatar(duracao)),
+        _Dado('Distância', '${km.toStringAsFixed(2)} km'),
+        _Dado('Média', '${media.toStringAsFixed(0)} km/h'),
+        _Dado('Máxima', '${_velocidadeMaxKmh.toStringAsFixed(0)} km/h'),
+        _Dado('Em lentidão', _formatar(_tempoLento)),
+      ],
+    );
+  }
+
+  // A lista de setores com tempos e diferenças (modo Setores)
+  Widget _tabelaSetores() {
+    final meus = _meusTempos!;
+    return SizedBox(
+      height: 220,
+      child: ListView.builder(
+        itemCount: meus.length,
+        itemBuilder: (context, k) {
+          final anterior = _temposAnteriores?[k];
+          final melhor = _melhoresAntes?[k];
+          return ListTile(
+            dense: true,
+            leading: CircleAvatar(
+              radius: 8,
+              backgroundColor: _cor(_corDoSetor(k)),
+            ),
+            title: Text('Setor ${k + 1} · ${_segundos(meus[k])}'),
+            subtitle: Text(
+              anterior == null || melhor == null
+                  ? 'Volta de referência'
+                  : 'vs anterior ${_diferenca(meus[k] - anterior)} · '
+                      'vs melhor ${_diferenca(meus[k] - melhor)}',
+            ),
+          );
+        },
       ),
     );
   }
