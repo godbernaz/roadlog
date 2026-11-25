@@ -39,7 +39,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
   String _corPara(double kmh) {
     if (kmh < 15) return '#E53935'; // vermelho: parado / trânsito
     if (kmh < 40) return '#FB8C00'; // laranja: lento
-    return '#43A047'; // verde: a andar bem
+    return '#1E88E5'; // azul: a andar bem
   }
 
   Map<String, dynamic> _troco(List<List<double>> coords, String cor) {
