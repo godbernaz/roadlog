@@ -67,10 +67,39 @@ class AppDatabase extends _$AppDatabase {
   }
 
   // Lista de viagens, a mais recente primeiro; atualiza-se sozinha
-  Stream<List<Viagem>> verViagens() {
-    return (select(viagens)
-          ..orderBy([(v) => OrderingTerm.desc(v.inicio)]))
+  // rotaId = só essa rota; semRota = só as viagens sem nome.
+  Stream<List<Viagem>> verViagens({int? rotaId, bool semRota = false}) {
+    final query = select(viagens)
+      ..orderBy([(v) => OrderingTerm.desc(v.inicio)]);
+    if (semRota) {
+      query.where((v) => v.rotaId.isNull());
+    } else if (rotaId != null) {
+      query.where((v) => v.rotaId.equals(rotaId));
+    }
+    return query.watch();
+  }
+
+  // Todas as rotas, por ordem alfabética
+  Stream<List<Rota>> verRotas() {
+    return (select(rotas)..orderBy([(r) => OrderingTerm.asc(r.nome)]))
         .watch();
+  }
+
+  Future<int> criarRota(String nome) {
+    return into(rotas).insert(RotasCompanion.insert(nome: nome));
+  }
+
+  Future<void> associarRota(int viagemId, int rotaId) {
+    return (update(viagens)..where((v) => v.id.equals(viagemId)))
+        .write(ViagensCompanion(rotaId: Value(rotaId)));
+  }
+
+  // Apaga primeiro os pontos e depois a viagem (tudo ou nada)
+  Future<void> apagarViagem(int viagemId) {
+    return transaction(() async {
+      await (delete(pontos)..where((p) => p.viagemId.equals(viagemId))).go();
+      await (delete(viagens)..where((v) => v.id.equals(viagemId))).go();
+    });
   }
 }
 
