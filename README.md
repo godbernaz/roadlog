@@ -1,17 +1,6 @@
-# roadlog
+# Roadlog
 
-A new Flutter project.
+App Android (Flutter) para gravar os meus tempos de casa até ao trabalho ou vice-versa,
+comparar rotas, ver onde apanho trânsito e estimar o consumo do combustível do meu carro.
 
-## Getting Started
-
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Projeto pessoal para aprender. Estado: em desenvolvimento.
