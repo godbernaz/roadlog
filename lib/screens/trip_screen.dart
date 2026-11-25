@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:material_ui/material_ui.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:drift/drift.dart' show Value;
+import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mb;
 import '../database.dart';
 import '../widgets/route_dialog.dart';
 
@@ -22,6 +24,11 @@ class _ViagemScreenState extends State<ViagemScreen> {
   double _distanciaMetros = 0;
   double _velocidadeAtualKmh = 0;
   DateTime? _inicio;
+
+  // Mapa
+  mb.MapboxMap? _mapa;
+  bool _rastoCriado = false;
+  bool _seguir = true;
 
   bool get _aGravar => _cronometro.isRunning;
 
@@ -55,14 +62,96 @@ class _ViagemScreenState extends State<ViagemScreen> {
         .showSnackBar(SnackBar(content: Text(texto)));
   }
 
+  // --- Mapa -------------------------------------------------------------
+
+  // O mapa foi criado: liga o ponto azul e centra na última posição conhecida
+  Future<void> _mapaCriado(mb.MapboxMap mapa) async {
+    _mapa = mapa;
+    await mapa.location.updateSettings(mb.LocationComponentSettings(
+      enabled: true,
+      pulsingEnabled: true,
+      puckBearingEnabled: true,
+      puckBearing: mb.PuckBearing.COURSE, // seta no sentido do movimento
+    ));
+    try {
+      final ultima = await Geolocator.getLastKnownPosition();
+      if (ultima != null) _centrar(ultima, animar: false);
+    } catch (_) {
+      // Ainda sem permissão: o mapa fica no Porto até começares a viagem
+    }
+  }
+
+  // Move a câmara para a posição, inclinada e virada no sentido em que vais
+  void _centrar(Position p, {bool animar = true}) {
+    final camera = mb.CameraOptions(
+      center: mb.Point(coordinates: mb.Position(p.longitude, p.latitude)),
+      zoom: 16.5,
+      pitch: 45,
+      bearing: p.speed > 2 ? p.heading : null, // parado, o rumo não é fiável
+    );
+    if (animar) {
+      _mapa?.easeTo(camera, mb.MapAnimationOptions(duration: 900));
+    } else {
+      _mapa?.setCamera(camera);
+    }
+  }
+
+  void _alternarSeguir() {
+    setState(() => _seguir = !_seguir);
+    if (_seguir && _pontos.isNotEmpty) _centrar(_pontos.last);
+  }
+
+  // Desenha (da primeira vez) ou atualiza a linha do percurso já feito
+  Future<void> _atualizarRasto() async {
+    final mapa = _mapa;
+    if (mapa == null || _pontos.length < 2) return;
+
+    final rasto = mb.Feature(
+      id: 1,
+      geometry: mb.LineString(coordinates: [
+        for (final p in _pontos) mb.Position(p.longitude, p.latitude),
+      ]),
+    );
+
+    if (!_rastoCriado) {
+      _rastoCriado = true;
+      await mapa.addSource(
+        mb.GeoJsonSource(id: 'rasto', data: jsonEncode(rasto.toJson())),
+      );
+      await mapa.addLayer(mb.LineLayer(
+        id: 'rasto-linha',
+        sourceId: 'rasto',
+        lineWidth: 6.0,
+        lineCap: mb.LineCap.ROUND,
+        lineJoin: mb.LineJoin.ROUND,
+        lineEmissiveStrength: 1.0,
+        lineColor: const Color(0xFF1E88E5).toARGB32(), // azul
+      ));
+    } else {
+      await mapa.updateGeoJSONSourceFeatures('rasto', 'rasto-dados', [rasto]);
+    }
+  }
+
+  // Apaga a linha da viagem anterior
+  Future<void> _limparRasto() async {
+    if (!_rastoCriado) return;
+    await _mapa?.removeStyleLayer('rasto-linha');
+    await _mapa?.removeStyleSource('rasto');
+    _rastoCriado = false;
+  }
+
+  // --- Viagem -----------------------------------------------------------
+
   // 2. Começa a viagem: cronómetro + GPS + ecrã sempre ligado
   Future<void> _iniciar() async {
     if (!await _temPermissaoGps()) return;
+    await _limparRasto();
 
     _pontos.clear();
     _distanciaMetros = 0;
     _velocidadeAtualKmh = 0;
     _inicio = DateTime.now();
+    _seguir = true;
 
     _cronometro
       ..reset()
@@ -95,9 +184,11 @@ class _ViagemScreenState extends State<ViagemScreen> {
     setState(() {
       _velocidadeAtualKmh = p.speed < 0 ? 0 : p.speed * 3.6; // m/s -> km/h
     });
+    if (_seguir) _centrar(p);
+    _atualizarRasto();
   }
 
-   // 4. Termina a viagem, guarda-a e pergunta a rota
+  // 4. Termina a viagem, guarda-a e pergunta a rota
   Future<void> _parar() async {
     _cronometro.stop();
     _timer?.cancel();
@@ -154,44 +245,78 @@ class _ViagemScreenState extends State<ViagemScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final texto = Theme.of(context).textTheme;
     return Scaffold(
       appBar: AppBar(title: const Text('Nova viagem')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              _formatar(_cronometro.elapsed),
-              style: Theme.of(context).textTheme.displayLarge,
-            ),
-            if (_inicio != null) Text('Partida às ${_hora(_inicio!)}'),
-            const SizedBox(height: 32),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      body: Column(
+        children: [
+          // Mapa em cima, com o botão de seguir no canto
+          Expanded(
+            child: Stack(
               children: [
-                _Indicador('Distância',
-                    '${(_distanciaMetros / 1000).toStringAsFixed(2)} km'),
-                _Indicador('Média',
-                    '${_velocidadeMediaKmh.toStringAsFixed(0)} km/h'),
-                _Indicador('Agora',
-                    '${_velocidadeAtualKmh.toStringAsFixed(0)} km/h'),
+                mb.MapWidget(
+                  key: const ValueKey('mapa-viagem'),
+                  styleUri: mb.MapboxStyles.STANDARD,
+                  viewport: mb.CameraViewportState(
+                    center: mb.Point(coordinates: mb.Position(-8.61, 41.15)),
+                    zoom: 12, // Porto, até haver posição
+                  ),
+                  onMapCreated: _mapaCriado,
+                ),
+                Positioned(
+                  right: 16,
+                  bottom: 16,
+                  child: FloatingActionButton.small(
+                    heroTag: 'seguir',
+                    tooltip: _seguir ? 'Deixar de seguir' : 'Seguir a minha posição',
+                    onPressed: _alternarSeguir,
+                    child: Icon(
+                      _seguir ? Icons.navigation : Icons.navigation_outlined,
+                    ),
+                  ),
+                ),
               ],
             ),
-            const SizedBox(height: 8),
-            Text('${_pontos.length} pontos GPS',
-                style: Theme.of(context).textTheme.bodySmall),
-            const SizedBox(height: 48),
-            FilledButton.icon(
-              onPressed: _aGravar ? _parar : _iniciar,
-              icon: Icon(_aGravar ? Icons.stop : Icons.play_arrow),
-              label: Text(_aGravar ? 'Terminar viagem' : 'Iniciar viagem'),
-              style: FilledButton.styleFrom(
-                minimumSize: const Size(240, 64),
-                backgroundColor: _aGravar ? Colors.red : null,
+          ),
+          // Painel em baixo: tempo, velocidades e botão
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(_formatar(_cronometro.elapsed), style: texto.displayMedium),
+                  if (_inicio != null) Text('Partida às ${_hora(_inicio!)}'),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      _Indicador('Distância',
+                          '${(_distanciaMetros / 1000).toStringAsFixed(2)} km'),
+                      _Indicador('Média',
+                          '${_velocidadeMediaKmh.toStringAsFixed(0)} km/h'),
+                      _Indicador('Agora',
+                          '${_velocidadeAtualKmh.toStringAsFixed(0)} km/h'),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text('${_pontos.length} pontos GPS', style: texto.bodySmall),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: _aGravar ? _parar : _iniciar,
+                    icon: Icon(_aGravar ? Icons.stop : Icons.play_arrow),
+                    label: Text(_aGravar ? 'Terminar viagem' : 'Iniciar viagem'),
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size(double.infinity, 56),
+                      backgroundColor: _aGravar ? Colors.red : null,
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
