@@ -46,3 +46,6 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Chaves locais (nunca enviar para o GitHub)
+env.json

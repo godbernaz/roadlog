@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import '../database.dart';
 import '../widgets/route_dialog.dart';
+import 'trip_detail_screen.dart';
 
 class HistoricoScreen extends StatefulWidget {
   const HistoricoScreen({super.key});
@@ -163,8 +164,19 @@ class _HistoricoScreenState extends State<HistoricoScreen> {
                 '${media.toStringAsFixed(0)} km/h',
               ),
               isThreeLine: true,
-              trailing: const Icon(Icons.more_vert),
-              onTap: () => _opcoes(v),
+                            trailing: IconButton(
+                icon: const Icon(Icons.more_vert),
+                onPressed: () => _opcoes(v),
+              ),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => DetalheViagemScreen(
+                    viagem: v,
+                    titulo: nomes[v.rotaId] ?? 'Rota sem nome',
+                  ),
+                ),
+              ),
             );
           },
         );

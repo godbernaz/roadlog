@@ -94,14 +94,22 @@ class AppDatabase extends _$AppDatabase {
         .write(ViagensCompanion(rotaId: Value(rotaId)));
   }
 
-  // Apaga primeiro os pontos e depois a viagem (tudo ou nada)
+// Apaga primeiro os pontos e depois a viagem (tudo ou nada)
   Future<void> apagarViagem(int viagemId) {
     return transaction(() async {
       await (delete(pontos)..where((p) => p.viagemId.equals(viagemId))).go();
       await (delete(viagens)..where((v) => v.id.equals(viagemId))).go();
     });
   }
-}
+
+  // Todos os pontos GPS de uma viagem, pela ordem em que foram gravados
+  Future<List<Ponto>> pontosDaViagem(int viagemId) {
+    return (select(pontos)
+          ..where((p) => p.viagemId.equals(viagemId))
+          ..orderBy([(p) => OrderingTerm.asc(p.hora)]))
+        .get();
+  }
+}   // ← fecha a classe AppDatabase
 
 // Uma única base de dados para toda a app
 final db = AppDatabase();
