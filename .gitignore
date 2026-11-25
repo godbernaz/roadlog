@@ -49,3 +49,4 @@ app.*.map.json
 
 # Chaves locais (nunca enviar para o GitHub)
 env.json
+android/build/
