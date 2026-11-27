@@ -32,7 +32,7 @@ class Pontos extends Table {
   RealColumn get precisao => real()(); // metros
 }
 
-// Novo (v2): os setores de cada rota, como distâncias ao longo da rota
+// Os setores de cada rota, como distâncias ao longo da rota
 @DataClassName('Setor')
 class Setores extends Table {
   IntColumn get id => integer().autoIncrement()();
@@ -42,7 +42,7 @@ class Setores extends Table {
   RealColumn get fimMetros => real()();
 }
 
-// Novo (v2): o tempo de cada volta em cada setor
+// O tempo de cada volta em cada setor (setores sem tempo não são guardados)
 @DataClassName('TempoSetor')
 class TemposSetor extends Table {
   IntColumn get id => integer().autoIncrement()();
@@ -57,7 +57,7 @@ class AppDatabase extends _$AppDatabase {
       : super(executor ?? _openConnection());
 
   @override
-  int get schemaVersion => 2; // era 1
+  int get schemaVersion => 2;
 
   // Como passar de uma versão para a seguinte sem perder dados
   @override
@@ -204,8 +204,9 @@ class AppDatabase extends _$AppDatabase {
       distanciasAcumuladas(referencia).last,
     ];
 
-    // 3. Tempos de cada volta (calculados antes de escrever)
-    final temposPorVolta = <int, List<double>>{};
+    // 3. Tempos de cada volta. null = setor sem tempo (saíste da rota nele).
+    //    Se a volta inteira for "outra rota", temposDosSetores devolve null.
+    final temposPorVolta = <int, List<double?>>{};
     for (final v in voltas) {
       final tempos =
           temposDosSetores(await pontosDaViagem(v.id), referencia, fronteiras);
@@ -228,10 +229,12 @@ class AppDatabase extends _$AppDatabase {
           .go();
       for (final e in temposPorVolta.entries) {
         for (var k = 0; k < e.value.length; k++) {
+          final segundos = e.value[k];
+          if (segundos == null) continue; // setor sem tempo: não se guarda
           await into(temposSetor).insert(TemposSetorCompanion.insert(
             viagemId: e.key,
             ordem: k + 1,
-            segundos: e.value[k],
+            segundos: segundos,
           ));
         }
       }
@@ -239,8 +242,9 @@ class AppDatabase extends _$AppDatabase {
   }
 
   // Tempos de todas as voltas de uma rota, por ordem cronológica:
-  // viagemId -> [segundos do setor 1, setor 2, ...]
-  Future<Map<int, List<double>>> temposDaRota(int rotaId) async {
+  // viagemId -> [setor 1, setor 2, ...], com null nos setores sem tempo
+  Future<Map<int, List<double?>>> temposDaRota(int rotaId) async {
+    final numeroSetores = (await setoresDaRota(rotaId)).length;
     final query = select(temposSetor).join([
       innerJoin(viagens, viagens.id.equalsExp(temposSetor.viagemId)),
     ])
@@ -249,10 +253,16 @@ class AppDatabase extends _$AppDatabase {
         OrderingTerm.asc(viagens.inicio),
         OrderingTerm.asc(temposSetor.ordem),
       ]);
-    final resultado = <int, List<double>>{};
+    final resultado = <int, List<double?>>{};
     for (final linha in await query.get()) {
       final t = linha.readTable(temposSetor);
-      resultado.putIfAbsent(t.viagemId, () => []).add(t.segundos);
+      final lista = resultado.putIfAbsent(
+        t.viagemId,
+        () => List<double?>.filled(numeroSetores, null),
+      );
+      if (t.ordem >= 1 && t.ordem <= lista.length) {
+        lista[t.ordem - 1] = t.segundos;
+      }
     }
     return resultado;
   }
