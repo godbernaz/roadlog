@@ -8,7 +8,9 @@ import 'database.dart';
 
 const double tamanhoMinimoSetor = 500; // metros
 const double desvioMaximo = 50; // metros fora da linha que ainda contam
-const double foraDaRotaMaximo = 0.2; // 20% dos pontos fora = outra rota
+const double foraDoSetorMaximo = 0.2; // 20% dos pontos fora = setor sem tempo
+const double foraDaRotaMaximo = 0.5; // 50% dos pontos fora = outra rota
+const double margemPortas = 50; // portas a 50 m do início e do fim
 
 // ---------- Geometria ------------------------------------------------
 
@@ -35,6 +37,25 @@ List<double> distanciasAcumuladas(List<Ponto> pontos) {
         distanciaMetros(a.latitude, a.longitude, b.latitude, b.longitude));
   }
   return acumulada;
+}
+
+/// A coordenada do ponto da linha que está a [d] metros do início.
+/// Serve para desenhar as fronteiras dos setores no mapa.
+({double lat, double lon}) pontoNaDistancia(List<Ponto> linha, double d) {
+  final dist = distanciasAcumuladas(linha);
+  for (var i = 1; i < linha.length; i++) {
+    if (dist[i] >= d) {
+      final a = linha[i - 1];
+      final b = linha[i];
+      final troco = dist[i] - dist[i - 1];
+      final f = troco <= 0 ? 0.0 : (d - dist[i - 1]) / troco;
+      return (
+        lat: a.latitude + (b.latitude - a.latitude) * f,
+        lon: a.longitude + (b.longitude - a.longitude) * f,
+      );
+    }
+  }
+  return (lat: linha.last.latitude, lon: linha.last.longitude);
 }
 
 // ---------- 1. Quantos setores ---------------------------------------
@@ -200,11 +221,16 @@ List<PontoNaRota> projetarNaRota(List<Ponto> volta, List<Ponto> referencia) {
   );
 }
 
-// ---------- 6. Tempo de cada setor -----------------------------------
+// ---------- 6. Tempo de cada setor (NOVO: portas e setores sem tempo) --
 
-/// Quanto tempo (segundos) a volta demorou em cada setor, ou null se a
-/// volta não é comparável (foi por outro caminho ou não chegou ao fim).
-List<double>? temposDosSetores(
+/// Tempo (segundos) de cada setor da volta. Um setor fica `null` (sem
+/// tempo) se saíste da rota nele ou se não o completaste. A função
+/// devolve `null` se a volta inteira foi por outro caminho.
+///
+/// O tempo é medido entre "portas": a partida fica a 50 m do início e a
+/// chegada a 50 m do fim, para não contar o tempo parado no estacionamento
+/// nem o momento em que carregas nos botões.
+List<double?>? temposDosSetores(
   List<Ponto> volta,
   List<Ponto> referencia,
   List<double> fronteiras,
@@ -213,62 +239,100 @@ List<double>? temposDosSetores(
   final total = distanciasAcumuladas(referencia).last;
   final proj = projetarNaRota(volta, referencia);
 
-  // Erro do GPS: alguns pontos fora da linha são normais; muitos = outra rota
+  // Mais de metade dos pontos fora da linha: é outra rota
   final fora = proj.where((p) => p.desvio > desvioMaximo).length;
   if (fora > proj.length * foraDaRotaMaximo) return null;
-  // Tem de ter chegado perto do fim da rota
-  if (proj.last.distancia < total - 300) return null;
 
-  // O momento em que passou cada fronteira, interpolado entre os dois
-  // pontos GPS à volta dela (os pontos chegam de 5 em 5 m, não na fronteira)
-  final passagens = <DateTime>[volta.first.hora];
-  var i = 0;
-  for (final f in fronteiras) {
-    while (i < proj.length - 1 && proj[i + 1].distancia < f) {
-      i++;
-    }
-    if (i >= proj.length - 1) return null; // não chegou a esta fronteira
-    final a = proj[i];
-    final b = proj[i + 1];
-    final troco = b.distancia - a.distancia;
-    final fracao =
-        troco <= 0 ? 0.0 : ((f - a.distancia) / troco).clamp(0.0, 1.0);
-    final ms = b.hora.difference(a.hora).inMilliseconds * fracao;
-    passagens.add(a.hora.add(Duration(milliseconds: ms.round())));
-  }
-  passagens.add(volta.last.hora);
+  final portas = [margemPortas, ...fronteiras, total - margemPortas];
+  final passagens = [for (final d in portas) _passagem(proj, d)];
 
   return [
-    for (var k = 1; k < passagens.length; k++)
-      passagens[k].difference(passagens[k - 1]).inMilliseconds / 1000,
+    for (var k = 0; k < portas.length - 1; k++)
+      _tempoDoSetor(proj, portas[k], portas[k + 1], passagens[k],
+          passagens[k + 1]),
   ];
 }
 
-// ---------- 7. Cores --------------------------------------------------
+/// A hora em que a volta passou a distância [d], interpolada entre os
+/// dois pontos GPS à volta dela. `null` se nunca lá passou.
+DateTime? _passagem(List<PontoNaRota> proj, double d) {
+  if (proj.first.distancia > d) return null; // começou depois desta porta
+  for (var i = 0; i < proj.length - 1; i++) {
+    final a = proj[i];
+    final b = proj[i + 1];
+    if (a.distancia <= d && b.distancia >= d) {
+      final troco = b.distancia - a.distancia;
+      final fracao = troco <= 0 ? 0.0 : (d - a.distancia) / troco;
+      final ms = b.hora.difference(a.hora).inMilliseconds * fracao;
+      return a.hora.add(Duration(milliseconds: ms.round()));
+    }
+  }
+  return null; // não chegou a esta porta
+}
 
-enum CorSetor { roxo, verde, amarelo, cinzento }
+/// O tempo de um setor, ou `null` se não conta (saíste da rota ou
+/// faltou uma das passagens).
+double? _tempoDoSetor(
+  List<PontoNaRota> proj,
+  double inicio,
+  double fim,
+  DateTime? entrada,
+  DateTime? saida,
+) {
+  if (entrada == null || saida == null || !saida.isAfter(entrada)) return null;
+  final noSetor =
+      proj.where((p) => p.distancia >= inicio && p.distancia <= fim).toList();
+  if (noSetor.isNotEmpty) {
+    final fora = noSetor.where((p) => p.desvio > desvioMaximo).length;
+    if (fora > noSetor.length * foraDoSetorMaximo) return null;
+  }
+  return saida.difference(entrada).inMilliseconds / 1000;
+}
 
-/// A cor de cada setor desta volta, comparando com as voltas anteriores da
-/// mesma rota. [temposDaRota] tem as voltas por ordem cronológica.
-List<CorSetor> coresDaVolta(int viagemId, Map<int, List<double>> temposDaRota) {
+// ---------- 7. Comparações e cores (NOVO: ignora setores sem tempo) ---
+
+enum CorSetor { roxo, verde, amarelo, cinzento, semTempo }
+
+/// Com que tempos se compara o setor [k] desta volta: o da última volta
+/// anterior que tem tempo nesse setor, e o melhor de todas as anteriores.
+({double? anterior, double? melhor}) comparacaoDoSetor(
+  int viagemId,
+  int k,
+  Map<int, List<double?>> temposDaRota,
+) {
   final ids = temposDaRota.keys.toList();
   final posicao = ids.indexOf(viagemId);
-  if (posicao < 0) return [];
-  final minhas = temposDaRota[viagemId]!;
-  final anteriores = [for (final id in ids.take(posicao)) temposDaRota[id]!];
+  if (posicao <= 0) return (anterior: null, melhor: null);
+  final validos = [
+    for (final id in ids.take(posicao)) temposDaRota[id]![k],
+  ].whereType<double>().toList();
+  if (validos.isEmpty) return (anterior: null, melhor: null);
+  return (
+    anterior: validos.last,
+    melhor: validos.reduce((a, b) => math.min(a, b)),
+  );
+}
 
+/// A cor de cada setor desta volta. [temposDaRota] tem as voltas por
+/// ordem cronológica.
+List<CorSetor> coresDaVolta(
+  int viagemId,
+  Map<int, List<double?>> temposDaRota,
+) {
+  final minhas = temposDaRota[viagemId];
+  if (minhas == null) return [];
   return [
     for (var k = 0; k < minhas.length; k++)
-      if (anteriores.isEmpty)
-        CorSetor.cinzento // primeira volta: ainda não há com que comparar
-      else if (minhas[k] <
-          anteriores.map((t) => t[k]).reduce((a, b) => math.min(a, b)))
-        CorSetor.roxo // melhor de sempre
-      else if (minhas[k] < anteriores.last[k])
-        CorSetor.verde // melhor do que a volta anterior
-      else
-        CorSetor.amarelo, // mais lento
+      _cor(minhas[k], comparacaoDoSetor(viagemId, k, temposDaRota)),
   ];
+}
+
+CorSetor _cor(double? meu, ({double? anterior, double? melhor}) c) {
+  if (meu == null) return CorSetor.semTempo;
+  if (c.anterior == null || c.melhor == null) return CorSetor.cinzento;
+  if (meu < c.melhor!) return CorSetor.roxo; // melhor de sempre
+  if (meu < c.anterior!) return CorSetor.verde; // melhor que a última
+  return CorSetor.amarelo; // mais lento
 }
 
 /// Em que setor (0, 1, 2...) está cada ponto de uma volta. Serve para

@@ -25,17 +25,18 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
   bool _estiloPronto = false;
   bool _desenhado = false;
   bool _aDesenhar = false;
+  bool _marcasDesenhadas = false;
   bool _em3d = false;
   List<Ponto> _pontos = [];
 
   // Setores (só existem se a viagem pertencer a uma rota)
   bool _temSetores = false;
   bool _modoSetores = false;
+  Map<int, List<double?>> _temposDaRota = {};
+  List<double?>? _meusTempos;
   List<CorSetor> _cores = [];
   List<int> _setorDoPonto = [];
-  List<double>? _meusTempos;
-  List<double>? _temposAnteriores;
-  List<double>? _melhoresAntes;
+  List<({double lat, double lon})> _marcas = [];
 
   @override
   void initState() {
@@ -56,7 +57,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     await _desenharPercurso();
   }
 
-  // Se a viagem pertence a uma rota, prepara as cores e os tempos dos setores
+  // Se a viagem pertence a uma rota, prepara cores, tempos e marcas
   Future<void> _carregarSetores(List<Ponto> pontos) async {
     final rotaId = widget.viagem.rotaId;
     if (rotaId == null || pontos.length < 2) return;
@@ -72,25 +73,16 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
 
     final tempos = await db.temposDaRota(rotaId);
     final meus = tempos[widget.viagem.id];
-    if (meus == null) return; // esta volta não é comparável com a rota
+    if (meus == null) return; // esta volta não é desta rota
 
     final referencia = await db.pontosDaViagem(referenciaId);
     final fronteiras = [for (final s in setores.skip(1)) s.inicioMetros];
-    final ids = tempos.keys.toList();
-    final anteriores = [
-      for (final id in ids.take(ids.indexOf(widget.viagem.id))) tempos[id]!,
-    ];
 
+    _temposDaRota = tempos;
     _meusTempos = meus;
-    _temposAnteriores = anteriores.isEmpty ? null : anteriores.last;
-    _melhoresAntes = anteriores.isEmpty
-        ? null
-        : [
-            for (var k = 0; k < meus.length; k++)
-              anteriores.map((t) => t[k]).reduce((a, b) => math.min(a, b)),
-          ];
     _cores = coresDaVolta(widget.viagem.id, tempos);
     _setorDoPonto = setorDeCadaPonto(pontos, referencia, fronteiras);
+    _marcas = [for (final f in fronteiras) pontoNaDistancia(referencia, f)];
     _temSetores = true;
     _modoSetores = true; // se há setores, mostra-os primeiro
   }
@@ -113,7 +105,6 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     return '#1E88E5'; // azul: a andar bem
   }
 
-  // Setores: roxo / verde / amarelo / cinzento
   String _corDoSetor(int indice) {
     if (indice >= _cores.length) return '#9E9E9E';
     return switch (_cores[indice]) {
@@ -121,6 +112,7 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       CorSetor.verde => '#43A047',
       CorSetor.amarelo => '#FDD835',
       CorSetor.cinzento => '#9E9E9E',
+      CorSetor.semTempo => '#424242', // cinzento escuro
     };
   }
 
@@ -167,9 +159,8 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       final ponto = [_pontos[i].longitude, _pontos[i].latitude];
       final s = _setorDoPonto[i];
       if (s != setor) {
-        // Fecha o setor anterior neste ponto, para a linha não ter buracos
         if (coords.isNotEmpty) {
-          coords.add(ponto);
+          coords.add(ponto); // fecha o setor anterior aqui, sem buracos
           trocos.add(_troco(coords, _corDoSetor(setor)));
         }
         coords = [ponto];
@@ -182,9 +173,27 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     return {'type': 'FeatureCollection', 'features': trocos};
   }
 
+  // As fronteiras dos setores, como pontos
+  Map<String, dynamic> _pontosFronteira() {
+    return {
+      'type': 'FeatureCollection',
+      'features': [
+        for (final m in _marcas)
+          {
+            'type': 'Feature',
+            'properties': <String, dynamic>{},
+            'geometry': {
+              'type': 'Point',
+              'coordinates': [m.lon, m.lat],
+            },
+          },
+      ],
+    };
+  }
+
   // --- Desenhar ----------------------------------------------------------
 
-  // Desenha (ou redesenha, ao trocar de modo) a linha do percurso
+  // Desenha (ou redesenha, ao trocar de modo) a linha e as marcas
   Future<void> _desenharPercurso() async {
     final mapa = _mapa;
     if (mapa == null || !_estiloPronto || _pontos.length < 2 || _aDesenhar) {
@@ -192,6 +201,11 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
     }
     _aDesenhar = true;
     final primeiraVez = !_desenhado;
+    if (_marcasDesenhadas) {
+      await mapa.removeStyleLayer('fronteiras-circulos');
+      await mapa.removeStyleSource('fronteiras');
+      _marcasDesenhadas = false;
+    }
     if (_desenhado) {
       await mapa.removeStyleLayer('percurso-linha');
       await mapa.removeStyleLayer('percurso-contorno');
@@ -219,6 +233,25 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       lineEmissiveStrength: 1.0,
       lineColorExpression: ['get', 'cor'],
     ));
+
+    // Bolinhas brancas nas fronteiras (só no modo Setores)
+    if (_modoSetores && _marcas.isNotEmpty) {
+      await mapa.addSource(GeoJsonSource(
+        id: 'fronteiras',
+        data: jsonEncode(_pontosFronteira()),
+      ));
+      await mapa.addLayer(CircleLayer(
+        id: 'fronteiras-circulos',
+        sourceId: 'fronteiras',
+        circleRadius: 6.0,
+        circleColor: Colors.white.toARGB32(),
+        circleStrokeColor: Colors.black.toARGB32(),
+        circleStrokeWidth: 2.0,
+        circleEmissiveStrength: 1.0,
+      ));
+      _marcasDesenhadas = true;
+    }
+
     _aDesenhar = false;
     if (primeiraVez) await _enquadrar();
   }
@@ -410,21 +443,27 @@ class _DetalheViagemScreenState extends State<DetalheViagemScreen> {
       child: ListView.builder(
         itemCount: meus.length,
         itemBuilder: (context, k) {
-          final anterior = _temposAnteriores?[k];
-          final melhor = _melhoresAntes?[k];
+          final meu = meus[k];
+          final c = comparacaoDoSetor(widget.viagem.id, k, _temposDaRota);
+          final String detalhe;
+          if (meu == null) {
+            detalhe = 'Sem tempo: saíste da rota neste setor';
+          } else if (c.anterior == null || c.melhor == null) {
+            detalhe = 'Primeiro tempo neste setor';
+          } else {
+            detalhe = 'vs anterior ${_diferenca(meu - c.anterior!)} · '
+                'vs melhor ${_diferenca(meu - c.melhor!)}';
+          }
           return ListTile(
             dense: true,
             leading: CircleAvatar(
               radius: 8,
               backgroundColor: _cor(_corDoSetor(k)),
             ),
-            title: Text('Setor ${k + 1} · ${_segundos(meus[k])}'),
-            subtitle: Text(
-              anterior == null || melhor == null
-                  ? 'Volta de referência'
-                  : 'vs anterior ${_diferenca(meus[k] - anterior)} · '
-                      'vs melhor ${_diferenca(meus[k] - melhor)}',
+            title: Text(
+              'Setor ${k + 1} · ${meu == null ? '—' : _segundos(meu)}',
             ),
+            subtitle: Text(detalhe),
           );
         },
       ),
